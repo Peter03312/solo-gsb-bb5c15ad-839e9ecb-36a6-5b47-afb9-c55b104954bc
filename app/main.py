@@ -25,7 +25,7 @@ from .schemas import (
     TripOut,
     TripReviewOut,
 )
-from .services.planning import find_itinerary
+from .services.planning import find_itinerary, load_occupancy
 from .services.reschedule import review_and_reschedule
 
 
@@ -312,6 +312,10 @@ def _resolve_base_revision(conn, base_revision: Optional[int]) -> int:
 @app.post("/api/trips/plan", response_model=PlanResponse, tags=["trips"])
 def plan_trip(body: PlanRequest):
     with get_conn() as conn:
+        blocked = load_occupancy(
+            conn, body.start_minute,
+            body.start_minute + body.window_minutes - 1,
+        )
         result = find_itinerary(
             conn,
             origin=body.origin,
@@ -322,13 +326,15 @@ def plan_trip(body: PlanRequest):
             height=body.height,
             margin=body.margin,
             revision=body.revision,
+            blocked=blocked,
         )
     return result
 
 
 @app.post("/api/trips/confirm", status_code=201, response_model=TripOut, tags=["trips"])
 def confirm_trip(body: ConfirmRequest):
-    """确认行程：必须携带所据修订号；同一事务内复核，过期/不一致即冲突且不保存。"""
+    """确认行程：必须携带所据修订号；同一事务内以最新潮位修订与当时占用
+    重新计算，过期/不一致即冲突且不保存。"""
     if body.revision is None:
         raise ApiError(422, "VALIDATION_ERROR", "确认行程必须携带所据潮位修订号 revision")
 
@@ -350,18 +356,35 @@ def confirm_trip(body: ConfirmRequest):
                      "current_revision": latest["revision"] if latest else None},
                 )
 
-            # 2) 同一事务内依据该修订重新计算
-            recalculated = find_itinerary(
-                conn,
-                origin=body.origin,
-                destination=body.destination,
-                start_minute=body.start_minute,
-                window_minutes=body.window_minutes,
-                draft=body.draft,
-                height=body.height,
-                margin=body.margin,
-                revision=body.revision,
+            # 2) 同一事务内依据该修订与**当时占用**重新计算
+            #    （既有已确认快照即使彼此重叠也一并作为占用；本行程尚未落库）
+            blocked = load_occupancy(
+                conn, body.start_minute, body.start_minute + body.window_minutes - 1
             )
+            try:
+                recalculated = find_itinerary(
+                    conn,
+                    origin=body.origin,
+                    destination=body.destination,
+                    start_minute=body.start_minute,
+                    window_minutes=body.window_minutes,
+                    draft=body.draft,
+                    height=body.height,
+                    margin=body.margin,
+                    revision=body.revision,
+                    blocked=blocked,
+                )
+            except ApiError as exc:
+                # 占用变化导致窗口内已无可行行程：提交行程不再符合最优结果
+                if exc.code == "NO_FEASIBLE_ITINERARY":
+                    raise ApiError(
+                        409,
+                        "PLAN_MISMATCH",
+                        "占用已变化：窗口内已不存在可行行程，提交行程不再符合"
+                        "最优结果，确认失败",
+                        {"reason": "no_feasible_itinerary"},
+                    )
+                raise
 
             # 3) 回填行程必须与复核结果逐段一致
             def norm(legs):

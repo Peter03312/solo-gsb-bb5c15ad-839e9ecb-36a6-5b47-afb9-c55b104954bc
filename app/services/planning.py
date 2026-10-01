@@ -7,6 +7,8 @@ d, d+1, ..., d+t-1，于 d+t 抵达下一节点）。
 约束（占用的每一分钟均须满足，按修订的预测误差带取保守极值）：
   * 深度：静水深度 + 名义潮位 − 误差 ≥ 吃水 + 安全余量（真值可能偏低）
   * 桥梁：桥底净空 − 名义潮位 − 误差 ≥ 水面以上高度 + 安全余量（真值可能偏高，有桥时）
+  * 独占：同一航段同一分钟已被其他**已确认**行程占用时不可再进入（进入
+    分钟 d 至抵达前一分钟 d+t-1 独占该航段；节点等待不占用航段）
 等待不占用航段，不参与校验。
 
 择优：最早抵达；同一抵达时刻按航段编号序列字典序（小者优先）。
@@ -14,6 +16,7 @@ d, d+1, ..., d+t-1，于 d+t 抵达下一节点）。
 最小的航段编号序列。该性质可安全剪枝——任何延续在相同状态上叠加后，
 前缀字典序大小关系不变。
 """
+import json
 from dataclasses import dataclass
 from typing import Optional
 
@@ -67,6 +70,33 @@ def _minute_ok(seg: Segment, tide: float, error: float,
     return True
 
 
+def load_occupancy(conn, lo: int, hi: int, exclude_trip_id: Optional[int] = None
+                   ) -> dict[int, set[int]]:
+    """读取 [lo, hi] 闭区间内全部已确认行程的航段占用。
+
+    返回 {seg_id: {占用分钟, ...}}。每段从进入分钟 d 起占用
+    d, d+1, …, d+travel_time-1（抵达分钟不占用）。既有快照即使彼此重叠也
+    原样保留——它们就是后续规划必须避开的占用。
+    exclude_trip_id 用于改期复核：建议须避开其他已确认快照，但排除自身。
+    """
+    sql = "SELECT itinerary FROM confirmed_trips"
+    params: list = []
+    if exclude_trip_id is not None:
+        sql += " WHERE trip_id <> ?"
+        params.append(exclude_trip_id)
+    occupied: dict[int, set[int]] = {}
+    for row in conn.execute(sql, params).fetchall():
+        for leg in json.loads(row["itinerary"]):
+            d, t = leg["start_minute"], leg["travel_time"]
+            end = d + t - 1
+            if end < lo or d > hi:
+                continue
+            occupied.setdefault(leg["seg_id"], set()).update(
+                range(max(lo, d), min(hi, end) + 1)
+            )
+    return occupied
+
+
 def _build_departure_feasible(
     segs: list[Segment],
     tide: dict[int, float],
@@ -75,21 +105,28 @@ def _build_departure_feasible(
     draft: float,
     height: float,
     margin: float,
+    blocked: Optional[dict[int, set[int]]] = None,
 ) -> dict[int, list[bool]]:
     """每条航段每个可能进入分钟（窗口内局部下标）是否可行。
 
-    用"不可行分钟"前缀和，令一次区间查询为 O(1)。
+    不可行原因有二：潮位误差带不满足水深/净空，或该占用区间与其他已确认
+    行程的占用（blocked：{seg_id: {绝对分钟}}）重叠。用"不可行分钟"前缀
+    和，令一次区间查询为 O(1)。
     """
+    blocked = blocked or {}
     feasible: dict[int, list[bool]] = {}
     horizon = start + window
 
     for seg in segs:
+        seg_blocked = blocked.get(seg.seg_id, ())
         # bad[i] 对应绝对分钟 start+i
         bad = [0] * window
         for i in range(window):
             m = start + i
             val = tide.get(m)
-            if val is None or not _minute_ok(seg, val[0], val[1], draft, height, margin):
+            if (val is None
+                    or not _minute_ok(seg, val[0], val[1], draft, height, margin)
+                    or m in seg_blocked):
                 bad[i] = 1
         pref = [0] * (window + 1)
         for i in range(window):
@@ -117,9 +154,12 @@ def find_itinerary(
     height: float,
     margin: float,
     revision: Optional[int] = None,
+    blocked: Optional[dict[int, set[int]]] = None,
 ) -> dict:
     """计算最早抵达行程。
 
+    blocked 给出须避开的已确认占用 {seg_id: {绝对分钟}}；缺省为不避占
+    （仅供不需要占用语义的内部调用）。
     未知节点 -> NODE_NOT_FOUND (404)
     窗口内缺潮位 -> MISSING_TIDE_DATA (422)
     无可行行程 -> NO_FEASIBLE_ITINERARY (404)
@@ -177,7 +217,8 @@ def find_itinerary(
         out_segs.setdefault(s.origin, []).append(s)
 
     feasible = _build_departure_feasible(
-        seg_list, tide, start_minute, window_minutes, draft, height, margin
+        seg_list, tide, start_minute, window_minutes, draft, height, margin,
+        blocked=blocked,
     )
 
     # 5) 按分钟展开的 DP
