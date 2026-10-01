@@ -7,6 +7,9 @@ d, d+1, ..., d+t-1，于 d+t 抵达下一节点）。
 约束（占用的每一分钟均须满足，按修订的预测误差带取保守极值）：
   * 深度：静水深度 + 名义潮位 − 误差 ≥ 吃水 + 安全余量（真值可能偏低）
   * 桥梁：桥底净空 − 名义潮位 − 误差 ≥ 水面以上高度 + 安全余量（真值可能偏高，有桥时）
+  * 航段占用冲突：两艘已确认船舶不得在同一分钟占用同一航段（seg_id 相同）；
+    已确认快照为不可变历史，即使彼此重叠也原样保留，后续规划必须避开它们
+    当时的占用。节点等待不占用航段，不参与任何校验。
 等待不占用航段，不参与校验。
 
 择优：最早抵达；同一抵达时刻按航段编号序列字典序（小者优先）。
@@ -14,6 +17,7 @@ d, d+1, ..., d+t-1，于 d+t 抵达下一节点）。
 最小的航段编号序列。该性质可安全剪枝——任何延续在相同状态上叠加后，
 前缀字典序大小关系不变。
 """
+import json
 from dataclasses import dataclass
 from typing import Optional
 
@@ -55,6 +59,34 @@ def _load_tide(conn, revision: int, lo: int, hi: int) -> dict[int, tuple[float, 
     return {r["minute"]: (r["level"], r["error"]) for r in rows}
 
 
+def _load_occupancy(
+    conn, lo: int, hi: int, exclude_trip_id: Optional[int] = None
+) -> dict[tuple[int, int], list[int]]:
+    """已确认快照对 [lo, hi] 内航段/分钟的占用。
+
+    每段行程于进入分钟 d 独占该航段 d..d+travel_time-1（抵达分钟不占用）。
+    已确认快照是不可变历史：即使彼此重叠也原样保留——返回的占用为各快照
+    占用的并集，同一 (seg_id, minute) 可对应多个 trip_id。``exclude_trip_id``
+    用于复核改期：建议须避开其他已确认快照，但排除该快照自身。
+    """
+    sql = "SELECT trip_id, itinerary FROM confirmed_trips"
+    params: tuple = ()
+    if exclude_trip_id is not None:
+        sql += " WHERE trip_id <> ?"
+        params = (exclude_trip_id,)
+    rows = conn.execute(sql, params).fetchall()
+
+    occupied: dict[tuple[int, int], list[int]] = {}
+    for row in rows:
+        trip_id = row["trip_id"]
+        for leg in json.loads(row["itinerary"]):
+            seg_id = leg["seg_id"]
+            end = leg["start_minute"] + leg["travel_time"] - 1  # 抵达前一分钟
+            for m in range(max(lo, leg["start_minute"]), min(hi, end) + 1):
+                occupied.setdefault((seg_id, m), []).append(trip_id)
+    return occupied
+
+
 def _minute_ok(seg: Segment, tide: float, error: float,
                draft: float, height: float, margin: float) -> bool:
     """航段在某一分钟是否满足深度/净空约束（按误差带取保守极值）。"""
@@ -75,11 +107,14 @@ def _build_departure_feasible(
     draft: float,
     height: float,
     margin: float,
+    occupied: Optional[dict[tuple[int, int], list]] = None,
 ) -> dict[int, list[bool]]:
     """每条航段每个可能进入分钟（窗口内局部下标）是否可行。
 
-    用"不可行分钟"前缀和，令一次区间查询为 O(1)。
+    用"不可行分钟"前缀和，令一次区间查询为 O(1)。不可行来源有二：
+    潮位误差带不满足水深/净空约束，或该分钟航段已被已确认船舶占用。
     """
+    occupied = occupied or {}
     feasible: dict[int, list[bool]] = {}
     horizon = start + window
 
@@ -91,6 +126,8 @@ def _build_departure_feasible(
             val = tide.get(m)
             if val is None or not _minute_ok(seg, val[0], val[1], draft, height, margin):
                 bad[i] = 1
+            elif (seg.seg_id, m) in occupied:
+                bad[i] = 1  # 同航段同分钟已被已确认船舶独占
         pref = [0] * (window + 1)
         for i in range(window):
             pref[i + 1] = pref[i] + bad[i]
@@ -117,9 +154,12 @@ def find_itinerary(
     height: float,
     margin: float,
     revision: Optional[int] = None,
+    exclude_trip_id: Optional[int] = None,
 ) -> dict:
     """计算最早抵达行程。
 
+    规划必须避开全部已确认快照的航段占用（exclude_trip_id 仅用于复核改期，
+    排除被复核快照自身）；节点等待不占航段。
     未知节点 -> NODE_NOT_FOUND (404)
     窗口内缺潮位 -> MISSING_TIDE_DATA (422)
     无可行行程 -> NO_FEASIBLE_ITINERARY (404)
@@ -176,8 +216,11 @@ def find_itinerary(
     for s in seg_list:
         out_segs.setdefault(s.origin, []).append(s)
 
+    # 已确认快照的航段占用：后续规划必须避开（不可变历史，重叠也原样保留）
+    occupied = _load_occupancy(conn, start_minute, horizon - 1, exclude_trip_id)
+
     feasible = _build_departure_feasible(
-        seg_list, tide, start_minute, window_minutes, draft, height, margin
+        seg_list, tide, start_minute, window_minutes, draft, height, margin, occupied
     )
 
     # 5) 按分钟展开的 DP

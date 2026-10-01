@@ -4,12 +4,14 @@
 
 1. **原航路复核**：保持快照中的航段编号顺序与原占用分钟，逐段逐分钟按目标
    修订的名义潮位与**误差带**校验水深（名义潮位−误差）与桥高（名义潮位+
-   误差，收紧净空），给出原行程是否安全；不安全时返回首次违规（航段、分钟、
+   误差，收紧净空），给出原行程是否安全。复核**只查潮位、不查他船航段占用**
+   （已确认快照即使彼此重叠也原样保留）；不安全时返回首次违规（航段、分钟、
    水深/净空原因，以及按对应极值计算的实际可用水深/净空）。
 2. **改期**：保持原航段编号顺序、船舶参数、原起始分钟与规划窗口不变，仅允许
    在节点重新等待（即只调整各段出发分钟，且出发必须与前段抵达首尾相接）。
    段一旦进入即连续占用 travel_time 分钟，窗口内占用的每一分钟均须满足
-   水深/净空约束。改期择优依次为：
+   水深/净空约束，且不得与**其他已确认快照**的同航段占用重叠（本快照自身
+   排除在外——改期建议不占位，快照不改写）。改期择优依次为：
      a. 相对快照，出发分钟发生变化的航段个数最少；
      b. 抵达分钟最早；
      c. 各段出发分钟序列字典序最小。
@@ -31,7 +33,12 @@ from typing import Optional
 
 from .. import config
 from ..errors import ApiError, tide_missing, trip_not_found
-from .planning import Segment, _build_departure_feasible, _load_segments
+from .planning import (
+    Segment,
+    _build_departure_feasible,
+    _load_occupancy,
+    _load_segments,
+)
 
 
 def review_and_reschedule(
@@ -41,6 +48,8 @@ def review_and_reschedule(
 ) -> dict:
     """按目标修订复核已确认行程，必要时求改期行程。
 
+    原航路只按目标修订查潮位（忽略他船占用）；改期避开其他已确认快照、
+    排除自身，且全程只读、不占位。
     未知行程 -> TRIP_NOT_FOUND (404)
     目标修订不存在 -> TIDE_REVISION_NOT_FOUND (404)
     窗口内缺潮位 -> MISSING_TIDE_DATA (422)
@@ -87,7 +96,9 @@ def review_and_reschedule(
 
     segs = _load_segments(conn)
 
-    # 4) 原航路复核：按快照航段顺序、原占用分钟逐段逐分钟，取首次违规
+    # 4) 原航路复核：按快照航段顺序、原占用分钟逐段逐分钟，取首次违规。
+    #    复核只按目标修订检查潮位（误差带），不检查航段占用冲突——已确认
+    #    快照即使彼此重叠也原样保留，不因他船占用而判为不安全。
     violation = _check_original(legs, segs, tide, draft, height, margin)
     safe = violation is None
 
@@ -114,9 +125,12 @@ def review_and_reschedule(
     if safe:
         return result
 
-    # 6) 不安全：在相同航段序列/参数/窗口下求改期行程
+    # 6) 不安全：在相同航段序列/参数/窗口下求改期行程。
+    #    改期建议须避开其他已确认快照的航段占用，但排除本快照自身
+    #    （建议不占位、快照不改写）。
+    occupied = _load_occupancy(conn, start, horizon - 1, exclude_trip_id=snap["trip_id"])
     resched = _reschedule(
-        legs, segs, tide, start, window, draft, height, margin, revision
+        legs, segs, tide, start, window, draft, height, margin, revision, occupied
     )
     if resched is None:
         result["no_solution"] = True
@@ -189,9 +203,13 @@ def _check_original(legs, segs, tide, draft, height, margin) -> Optional[dict]:
 
 
 def _reschedule(
-    legs, segs, tide, start, window, draft, height, margin, revision
+    legs, segs, tide, start, window, draft, height, margin, revision, occupied=None
 ) -> Optional[dict]:
-    """固定航段序列的时间展开 DP，返回最优改期或 None。"""
+    """固定航段序列的时间展开 DP，返回最优改期或 None。
+
+    除潮位误差带外，每个进入分钟还须避开其他已确认快照的航段占用
+    （occupied 已排除本快照自身）；等待不占航段。
+    """
     k = len(legs)
     if k == 0:
         return None  # 零航段始终安全，不会进入这里
@@ -199,9 +217,9 @@ def _reschedule(
     used = [segs[leg["seg_id"]] for leg in legs]
     original_deps = [leg["start_minute"] for leg in legs]
 
-    # 每个（快照序中的）航段在各进入分钟是否全程可行
+    # 每个（快照序中的）航段在各进入分钟是否全程可行（潮位 + 占用）
     feasible = _build_departure_feasible(
-        used, tide, start, window, draft, height, margin
+        used, tide, start, window, draft, height, margin, occupied
     )
 
     n = window

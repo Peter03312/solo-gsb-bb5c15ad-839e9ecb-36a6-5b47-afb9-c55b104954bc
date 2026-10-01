@@ -25,7 +25,7 @@ from .schemas import (
     TripOut,
     TripReviewOut,
 )
-from .services.planning import find_itinerary
+from .services.planning import _load_occupancy, _load_segments, find_itinerary
 from .services.reschedule import review_and_reschedule
 
 
@@ -350,7 +350,8 @@ def confirm_trip(body: ConfirmRequest):
                      "current_revision": latest["revision"] if latest else None},
                 )
 
-            # 2) 同一事务内依据该修订重新计算
+            # 2) 同一事务内依据该修订与当时已确认占用重新计算（事务以
+            #    BEGIN IMMEDIATE 取得写锁，占用快照在此刻一致）
             recalculated = find_itinerary(
                 conn,
                 origin=body.origin,
@@ -435,6 +436,37 @@ def get_trip(trip_id: int):
     return _trip_out(dict(row))
 
 
+@app.get("/api/occupancy", tags=["trips"])
+def get_occupancy(from_minute: int = 0, to_minute: int = 1439):
+    """已确认快照的航段占用（只读查询）。
+
+    每段行程于进入分钟 d 独占该航段 d..d+travel_time-1（抵达分钟不占用）。
+    已确认快照为不可变历史，即使彼此重叠也原样返回；同一航段同一分钟的
+    ``trip_ids`` 可能含多个行程。结果按 seg_id、minute 升序。
+    """
+    if from_minute < 0 or to_minute < from_minute:
+        raise ApiError(422, "VALIDATION_ERROR",
+                       "非法分钟区间：需 from_minute >= 0 且 to_minute >= from_minute",
+                       {"from_minute": from_minute, "to_minute": to_minute})
+    with get_conn() as conn:
+        occupied = _load_occupancy(conn, from_minute, to_minute)
+        seg_ids = {sid for sid, _ in occupied}
+        segs = {s.seg_id: s for s in _load_segments(conn).values() if s.seg_id in seg_ids}
+
+    entries = []
+    for (sid, minute) in sorted(occupied):
+        seg = segs.get(sid)
+        entries.append({
+            "seg_id": sid,
+            "origin": seg.origin if seg else None,
+            "destination": seg.destination if seg else None,
+            "minute": minute,
+            "trip_ids": sorted(occupied[(sid, minute)]),
+        })
+    return {"from_minute": from_minute, "to_minute": to_minute,
+            "count": len(entries), "occupancy": entries}
+
+
 @app.post(
     "/api/trips/{trip_id}/review",
     response_model=TripReviewOut,
@@ -443,9 +475,11 @@ def get_trip(trip_id: int):
 def review_trip(trip_id: int, body: Optional[ReviewRequest] = None):
     """潮位更正后复核已确认行程，并在不安全时求改期行程。
 
-    只读操作：保持快照航段编号顺序、船舶参数、原起始分钟与规划窗口，仅允许
-    在节点重新等待；改期择优为「变动航段数最少 → 抵达最早 → 出发分钟序列
-    字典序最小」。窗口内无解时返回原行程风险与 no_solution，不修改快照。
+    只读操作：原快照只按目标修订查潮位误差带（不查他船占用）；改期保持
+    快照航段编号顺序、船舶参数、原起始分钟与规划窗口，仅允许在节点重新
+    等待，并避开其他已确认快照的航段占用（排除自身）。择优为「变动航段数
+    最少 → 抵达最早 → 出发分钟序列字典序最小」。窗口内无解时返回原行程
+    风险与 no_solution，不修改快照、建议不占位。
     """
     target_revision = body.target_revision if body is not None else None
     with get_conn() as conn:
